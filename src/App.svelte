@@ -8,6 +8,7 @@
   import { log, onOpenUrl } from "./lib/invoker";
   import Clip from "./page/Clip.svelte";
   import Task from "./page/Task.svelte";
+  import Recognition from "./page/Recognition.svelte";
   import AI from "./page/AI.svelte";
   import Archive from "./page/Archive.svelte";
   import { onMount } from "svelte";
@@ -85,6 +86,9 @@
       </div>
       <div class="page" class:visible={active == "任务"}>
         <Task />
+      </div>
+      <div class="page" class:visible={active == "识别和标记"}>
+        <Recognition />
       </div>
       <div class="page" class:visible={active == "助手"}>
         <AI />

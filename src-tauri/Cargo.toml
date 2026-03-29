@@ -66,6 +66,10 @@ sanitize-filename = "0.6.0"
 socketioxide = "0.17.2"
 scraper = "0.24.0"
 sentry = { version = "0.46.0", features = ["log", "logs"] }
+image = "0.25.1"
+imageproc = "0.25.0"
+ort = "2.0.0-rc.12"
+ndarray = "0.17.2"
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem
@@ -145,6 +149,9 @@ optional = true
 version = "2"
 features = []
 optional = true
+
+[build-dependencies.cc]
+version = "1.2"
 
 [target.'cfg(windows)'.dependencies]
 whisper-rs = { version = "0.15.1", default-features = false }

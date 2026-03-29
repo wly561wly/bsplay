@@ -4,6 +4,7 @@
     Info,
     LayoutDashboard,
     List,
+    ScanSearch,
     Settings,
     Users,
     Video,
@@ -53,6 +54,11 @@
     <SidebarItem label="任务" {activeUrl} on:activeChange={navigate}>
       <div slot="icon">
         <List class="w-5 h-5" />
+      </div>
+    </SidebarItem>
+    <SidebarItem label="识别和标记" {activeUrl} on:activeChange={navigate}>
+      <div slot="icon">
+        <ScanSearch class="w-5 h-5" />
       </div>
     </SidebarItem>
     <SidebarItem label="助手" {activeUrl} on:activeChange={navigate}>

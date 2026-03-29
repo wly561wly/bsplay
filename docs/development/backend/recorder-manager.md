@@ -527,3 +527,46 @@ fn main() {
 4. **并发控制**: 使用 Mutex/RwLock 保护共享状态
 5. **事件通知**: 及时向前端发送状态更新
 6. **日志记录**: 记录关键操作和错误信息
+
+## 识别和标记（阶段化落地）
+
+当前已接入第一阶段可运行能力，入口命令为 `recognize_and_mark_videos`，实现文件位于 `src-tauri/src/handlers/recognition.rs`。
+
+### 阶段 1（已完成）
+
+1. 扫描待识别目录的视频文件，自动跳过已标记文件（`[completed]` 前缀）
+2. 按固定间隔抽帧（默认 1 秒，可配置）
+3. 使用模板匹配识别 `loading` / `banpick` / `ending` / `vectory`
+4. 输出识别结果 JSON，并在输出目录生成 `[completed]原文件名`
+5. 采用单帧临时文件复用，避免保存整段抽帧图片，降低额外存储开销
+
+### 阶段 2（待实现）
+
+1. 区域 OCR（ROI）识别：英雄名、对局时间、结算关键词
+2. 在关键区间提高抽帧频率（加载/结算附近）
+3. 结果字段结构化：开始时间、结束时间、胜负、OCR摘要
+
+### 阶段 3（待实现）
+
+1. 从缓存分片流直接识别并打标，无需先合成 mp4
+2. 接入特殊素材库与 ID 标记策略，支持撞车/高光对局识别
+3. 对接任务系统，支持进度上报、暂停、重试
+
+## 训练集构建与模型训练（已接入）
+
+实现位置：`src-tauri/src/handlers/recognition.rs`
+
+1. `build_recognition_dataset`
+2. `update_dataset_sample_label` / `update_dataset_sample_labels_bulk`
+3. `update_dataset_sample_phase` / `update_dataset_sample_phases_bulk`
+4. `export_recognition_dataset`
+5. `train_and_update_recognition_model`
+
+当前训练集流程要点：
+
+1. 每个视频采用“均匀采样”抽帧，避免样本集中在前几分钟。
+2. 抽帧采用受限并发（默认自动估算，可手动设置并发上限），在提升速度的同时限制 CPU/内存压力。
+3. 支持跳过已构建视频与复用已有 `staging/manifest.json`，便于重启后增量构建。
+4. 样本阶段类别固定为 6 类：`banpick` / `loading` / `gaming` / `victory_or_defeat` / `ending` / `other`。
+5. `label_status`（correct/wrong/pending）表示“校验状态”，不等同于阶段类别。
+6. 导出后写入 YOLO 目录与 `dataset.yaml`，训练命令默认使用 `yolov8n.pt` 并导出 ONNX 覆盖目标模型。

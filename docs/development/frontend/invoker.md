@@ -77,6 +77,107 @@ async function loadRooms(): Promise<Room[]> {
 
 ## 常用命令封装
 
+### 识别与训练集命令
+
+```typescript
+// 批量识别（输出识别 JSON）
+export async function recognizeAndMarkVideos(args: {
+  sourceDir?: string;
+  outputDir?: string;
+  frameIntervalSec?: number;
+  enableOcr?: boolean;
+  dumpFrames?: boolean;
+}) {
+  return await invoke('recognize_and_mark_videos', args);
+}
+
+// 构建训练集样本（staging/manifest.json + 抽帧样本）
+export async function buildRecognitionDataset(args: {
+  sourceDir: string;
+  outputDir: string;
+  modelPath?: string;
+  highConfidenceThreshold?: number;
+  lowConfidenceThreshold?: number;
+  maxSamplesPerVideo?: number;
+  extractWorkers?: number;      // 0=自动，根据 CPU/负载保守并发
+  skipExistingVideos?: boolean; // 默认 true，复用已有 staging/manifest
+}) {
+  return await invoke('build_recognition_dataset', args);
+}
+
+// build_recognition_dataset.phase_model_mode 可能值：
+// - heuristic
+// - onnx-active
+// - onnx-failed-fallback-heuristic
+// build_recognition_dataset.frame_extract_workers: 实际使用的抽帧并发数
+
+// 更新样本校验状态（correct/wrong/pending）
+export async function updateDatasetSampleLabel(args: {
+  outputDir: string;
+  sampleId: string;
+  status: 'correct' | 'wrong' | 'pending';
+}) {
+  return await invoke('update_dataset_sample_label', args);
+}
+
+// 批量更新样本校验状态
+export async function updateDatasetSampleLabelsBulk(args: {
+  outputDir: string;
+  sampleIds: string[];
+  status: 'correct' | 'wrong' | 'pending';
+}) {
+  return await invoke('update_dataset_sample_labels_bulk', args);
+}
+
+// 更新单个样本阶段（6类）
+export async function updateDatasetSamplePhase(args: {
+  outputDir: string;
+  sampleId: string;
+  phase: 'banpick' | 'loading' | 'gaming' | 'victory_or_defeat' | 'ending' | 'other';
+}) {
+  return await invoke('update_dataset_sample_phase', args);
+}
+
+// 批量更新样本阶段（6类）
+export async function updateDatasetSamplePhasesBulk(args: {
+  outputDir: string;
+  sampleIds: string[];
+  phase: 'banpick' | 'loading' | 'gaming' | 'victory_or_defeat' | 'ending' | 'other';
+}) {
+  return await invoke('update_dataset_sample_phases_bulk', args);
+}
+
+// 导出 YOLO 数据集目录（images/train + images/val + labels）
+export async function exportRecognitionDataset(args: {
+  outputDir: string;
+  detectionModelPath?: string;
+  detectionConfThreshold?: number;
+  detectionIouThreshold?: number;
+}) {
+  return await invoke('export_recognition_dataset', args);
+}
+
+// export_recognition_dataset 返回新增字段：
+// - train_images_count / val_images_count
+// - estimated_accuracy（基于人工校验 correct/wrong 的估计值）
+// - bbox_model_mode（onnx-active / roi-fallback / onnx-failed-fallback-roi）
+// - detected_box_labels（使用检测框写标注的数量）
+// - fallback_roi_labels（回退ROI写标注的数量）
+// - dataset.yaml 的类别固定为 6 类：banpick/loading/gaming/victory_or_defeat/ending/other
+
+// 训练并自动更新识别模型（Ultralytics -> ONNX -> 覆盖目标模型）
+export async function trainAndUpdateRecognitionModel(args: {
+  datasetDir: string;        // 包含 dataset.yaml
+  outputDir: string;         // 训练输出目录
+  targetModelPath: string;   // 目标 onnx 文件路径
+  epochs?: number;
+  imgsz?: number;
+  pythonBin?: string;        // 默认 python
+}) {
+  return await invoke('train_and_update_recognition_model', args);
+}
+```
+
 ### 录制相关命令
 
 ```typescript
@@ -258,6 +359,41 @@ export interface Clip {
 export interface StartRecordingParams {
   roomId: string;
 }
+
+## 识别和标记命令
+
+前端“识别和标记”页面通过 `invoke` 调用后端命令 `recognize_and_mark_videos`。
+
+```typescript
+type RecognitionBatchResult = {
+  processed: number;
+  skipped: number;
+  source_dir: string;
+  output_dir: string;
+  templates_dir: string;
+  interval_sec: number;
+  results: Array<{
+    file_name: string;
+    status: string;
+    start_time_sec: number | null;
+    end_time_sec: number | null;
+    victory: boolean;
+    ocr_preview: string | null;
+    output_file: string | null;
+    result_file: string | null;
+    error: string | null;
+  }>;
+};
+
+const result = await invoke<RecognitionBatchResult>("recognize_and_mark_videos", {
+  sourceDir: "/path/to/videos",
+  outputDir: "/path/to/recognition_completed",
+  frameIntervalSec: 1,
+  enableOcr: true,
+});
+```
+
+该命令的第一阶段目标是“低存储占用的模板匹配流程”：仅复用单帧临时图片，不落地整段抽帧结果。
 
 export interface CreateClipParams {
   recordingId: string;
