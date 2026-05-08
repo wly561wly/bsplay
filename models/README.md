@@ -30,3 +30,11 @@ python -m ultralytics yolo export model=/path/to/best.pt format=onnx imgsz=640
 ```
 
 Then copy exported `best.onnx` to `models/yolo_game.onnx`.
+
+## Notebook workflow (recommended for advanced training)
+
+This repo includes a notebook-based workflow that covers frame extraction,
+labeling/verification, YOLO export, training, and ONNX export:
+
+- See [train/README.md](../train/README.md)
+- Notebook: train/recognition_training.ipynb

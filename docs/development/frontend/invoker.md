@@ -165,16 +165,28 @@ export async function exportRecognitionDataset(args: {
 // - fallback_roi_labels（回退ROI写标注的数量）
 // - dataset.yaml 的类别固定为 6 类：banpick/loading/gaming/victory_or_defeat/ending/other
 
-// 训练并自动更新识别模型（Ultralytics -> ONNX -> 覆盖目标模型）
-export async function trainAndUpdateRecognitionModel(args: {
+// 后台启动训练任务（可暂停，支持继续训练或重新训练）
+export async function startRecognitionTrainingTask(args: {
   datasetDir: string;        // 包含 dataset.yaml
   outputDir: string;         // 训练输出目录
   targetModelPath: string;   // 目标 onnx 文件路径
   epochs?: number;
   imgsz?: number;
   pythonBin?: string;        // 默认 python
+  resumeTraining?: boolean;  // true=继续训练（基于 last.pt）
+  resetRun?: boolean;        // true=重新训练（清空旧 run）
 }) {
-  return await invoke('train_and_update_recognition_model', args);
+  return await invoke('start_recognition_training_task', args);
+}
+
+// 查询训练状态（轮询）
+export async function getRecognitionTrainingStatus() {
+  return await invoke('get_recognition_training_status');
+}
+
+// 暂停训练（终止当前训练进程，保留已有 checkpoint）
+export async function stopRecognitionTraining() {
+  return await invoke('stop_recognition_training');
 }
 ```
 

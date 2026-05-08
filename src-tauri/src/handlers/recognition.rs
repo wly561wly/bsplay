@@ -1,19 +1,21 @@
 use crate::ffmpeg;
-use crate::state::State;
 use crate::state_type;
 use chrono::Utc;
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage};
 use imageproc::template_matching::{find_extremes, match_template, MatchTemplateMethod};
 use ndarray::Array4;
-use ort::{session::Session, value::Tensor};
+use ort::session::Session;
+use ort::value::Tensor;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinHandle;
 
 #[cfg(feature = "gui")]
 use tauri::State as TauriState;
@@ -115,10 +117,10 @@ pub struct BuildDatasetResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DatasetManifest {
-    source_dir: String,
-    output_dir: String,
-    samples: Vec<BuildDatasetSample>,
+pub struct DatasetManifest {
+    pub source_dir: String,
+    pub output_dir: String,
+    pub samples: Vec<BuildDatasetSample>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +147,66 @@ pub struct TrainModelResult {
     pub report_file: String,
     pub train_stdout_tail: String,
     pub train_stderr_tail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecognitionTrainingStatus {
+    pub running: bool,
+    pub resume_mode: bool,
+    pub phase: String,
+    pub message: String,
+    pub dataset_dir: String,
+    pub output_dir: String,
+    pub run_dir: String,
+    pub target_model_path: String,
+    pub epochs: u32,
+    pub imgsz: u32,
+    pub python_bin: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub stopped_by_user: bool,
+    pub last_error: Option<String>,
+    pub result: Option<TrainModelResult>,
+}
+
+impl Default for RecognitionTrainingStatus {
+    fn default() -> Self {
+        Self {
+            running: false,
+            resume_mode: false,
+            phase: "idle".to_string(),
+            message: "当前无训练任务".to_string(),
+            dataset_dir: String::new(),
+            output_dir: String::new(),
+            run_dir: String::new(),
+            target_model_path: String::new(),
+            epochs: 0,
+            imgsz: 0,
+            python_bin: String::new(),
+            started_at: None,
+            finished_at: None,
+            stopped_by_user: false,
+            last_error: None,
+            result: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecognitionTrainingRuntime {
+    status: RecognitionTrainingStatus,
+    active_pid: Option<u32>,
+    stop_requested: bool,
+    handle: Option<JoinHandle<()>>,
+}
+
+static RECOGNITION_TRAIN_RUNTIME: OnceLock<Arc<Mutex<RecognitionTrainingRuntime>>> =
+    OnceLock::new();
+
+fn train_runtime() -> Arc<Mutex<RecognitionTrainingRuntime>> {
+    RECOGNITION_TRAIN_RUNTIME
+        .get_or_init(|| Arc::new(Mutex::new(RecognitionTrainingRuntime::default())))
+        .clone()
 }
 
 #[derive(Debug, Clone)]
@@ -1448,7 +1510,6 @@ pub async fn build_recognition_dataset(
     }
 
     let videos = collect_videos(&source_path, &output_path)?;
-    let mut newly_added = 0usize;
 
     for video in &videos {
         let video_path_text = video.to_string_lossy().to_string();
@@ -1555,7 +1616,7 @@ pub async fn build_recognition_dataset(
                 };
 
                 samples.push(BuildDatasetSample {
-                    id: sample_id,
+                    id: sample_id.clone(),
                     image_path: frame_path.to_string_lossy().to_string(),
                     video_path: video.to_string_lossy().to_string(),
                     timestamp_sec: sec,
@@ -1566,7 +1627,6 @@ pub async fn build_recognition_dataset(
                     label_status: default_status.to_string(),
                 });
                 known_sample_ids.insert(sample_id);
-                newly_added += 1;
                 video_added += 1;
             }
         }
@@ -1914,6 +1974,111 @@ pub async fn train_and_update_recognition_model(
     let imgsz = imgsz.unwrap_or(640).clamp(320, 1280);
     let python_bin = python_bin.unwrap_or_else(|| "python".to_string());
 
+    run_training_pipeline(
+        dataset_dir,
+        output_dir,
+        target_model_path,
+        epochs,
+        imgsz,
+        python_bin,
+        false,
+        false,
+        None,
+    )
+    .await
+}
+
+async fn run_command_capture_with_runtime(
+    mut cmd: tokio::process::Command,
+    runtime: Option<Arc<Mutex<RecognitionTrainingRuntime>>>,
+    phase: &str,
+) -> Result<(String, String), String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("执行命令失败({phase}): {e}"))?;
+
+    let pid = child.id();
+    if let (Some(rt), Some(child_pid)) = (runtime.clone(), pid) {
+        let mut guard = rt.lock().await;
+        guard.active_pid = Some(child_pid);
+        guard.status.phase = phase.to_string();
+        guard.status.message = format!("{phase}中...");
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("等待命令输出失败({phase}): {e}"))?;
+
+    if let Some(rt) = runtime {
+        let mut guard = rt.lock().await;
+        guard.active_pid = None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        return Err(format!(
+            "执行失败({phase}):\n{}\n{}",
+            trim_tail(&stdout, 2000),
+            trim_tail(&stderr, 2000)
+        ));
+    }
+
+    Ok((stdout, stderr))
+}
+
+async fn terminate_process(pid: u32) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = tokio::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let out = cmd
+            .output()
+            .await
+            .map_err(|e| format!("暂停训练失败: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "暂停训练失败: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let out = tokio::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output()
+            .await
+            .map_err(|e| format!("暂停训练失败: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "暂停训练失败: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn run_training_pipeline(
+    dataset_dir: String,
+    output_dir: String,
+    target_model_path: String,
+    epochs: u32,
+    imgsz: u32,
+    python_bin: String,
+    resume_training: bool,
+    reset_run: bool,
+    runtime: Option<Arc<Mutex<RecognitionTrainingRuntime>>>,
+) -> Result<TrainModelResult, String> {
+
     let dataset_path = PathBuf::from(&dataset_dir);
     let dataset_yaml = dataset_path.join("dataset.yaml");
     if !dataset_yaml.exists() {
@@ -1923,41 +2088,60 @@ pub async fn train_and_update_recognition_model(
     let run_root = PathBuf::from(&output_dir);
     ensure_dir(&run_root)?;
     let run_name = "recognition_yolo";
+    let run_dir = run_root.join(run_name);
+
+    if reset_run && run_dir.exists() {
+        std::fs::remove_dir_all(&run_dir)
+            .map_err(|e| format!("清理旧训练目录失败: {} - {}", run_dir.display(), e))?;
+    }
 
     let mut train_cmd = tokio::process::Command::new(&python_bin);
     #[cfg(target_os = "windows")]
     train_cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let train_output = train_cmd
-        .args([
-            "-m",
-            "ultralytics",
-            "yolo",
-            "detect",
-            "train",
-            &format!("data={}", dataset_yaml.to_string_lossy()),
-            "model=yolov8n.pt",
-            &format!("epochs={epochs}"),
-            &format!("imgsz={imgsz}"),
-            &format!("project={}", run_root.to_string_lossy()),
-            &format!("name={run_name}"),
-            "exist_ok=True",
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("执行训练命令失败: {e}"))?;
+    let mut train_args: Vec<String> = vec![
+        "-m".to_string(),
+        "ultralytics".to_string(),
+        "yolo".to_string(),
+        "detect".to_string(),
+        "train".to_string(),
+        format!("data={}", dataset_yaml.to_string_lossy()),
+        format!("epochs={epochs}"),
+        format!("imgsz={imgsz}"),
+        format!("project={}", run_root.to_string_lossy()),
+        format!("name={run_name}"),
+        "exist_ok=True".to_string(),
+    ];
 
-    let train_stdout = String::from_utf8_lossy(&train_output.stdout).to_string();
-    let train_stderr = String::from_utf8_lossy(&train_output.stderr).to_string();
-    if !train_output.status.success() {
-        return Err(format!(
-            "训练失败:\n{}\n{}",
-            trim_tail(&train_stdout, 2000),
-            trim_tail(&train_stderr, 2000)
-        ));
+    if resume_training {
+        let last_pt = run_dir.join("weights").join("last.pt");
+        if !last_pt.exists() {
+            return Err(format!(
+                "继续训练失败，未找到 last.pt: {}。请先执行一次训练。",
+                last_pt.display()
+            ));
+        }
+        train_args.push(format!("model={}", last_pt.to_string_lossy()));
+        train_args.push("resume=True".to_string());
+    } else {
+        train_args.push("model=yolov8n.pt".to_string());
     }
 
-    let run_dir = run_root.join(run_name);
+    train_cmd.args(train_args.iter().map(String::as_str));
+    let (train_stdout, train_stderr) = run_command_capture_with_runtime(
+        train_cmd,
+        runtime.clone(),
+        "training",
+    )
+    .await?;
+
+    if let Some(rt) = runtime.clone() {
+        let guard = rt.lock().await;
+        if guard.stop_requested {
+            return Err("训练已暂停，可选择继续训练。".to_string());
+        }
+    }
+
     let best_pt = run_dir.join("weights").join("best.pt");
     if !best_pt.exists() {
         return Err(format!("训练完成但未找到 best.pt: {}", best_pt.display()));
@@ -1967,28 +2151,27 @@ pub async fn train_and_update_recognition_model(
     #[cfg(target_os = "windows")]
     export_cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let export_output = export_cmd
-        .args([
-            "-m",
-            "ultralytics",
-            "yolo",
-            "export",
-            &format!("model={}", best_pt.to_string_lossy()),
-            "format=onnx",
-            &format!("imgsz={imgsz}"),
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("执行导出命令失败: {e}"))?;
+    export_cmd.args([
+        "-m",
+        "ultralytics",
+        "yolo",
+        "export",
+        &format!("model={}", best_pt.to_string_lossy()),
+        "format=onnx",
+        &format!("imgsz={imgsz}"),
+    ]);
+    let (export_stdout, export_stderr) = run_command_capture_with_runtime(
+        export_cmd,
+        runtime.clone(),
+        "exporting",
+    )
+    .await?;
 
-    let export_stdout = String::from_utf8_lossy(&export_output.stdout).to_string();
-    let export_stderr = String::from_utf8_lossy(&export_output.stderr).to_string();
-    if !export_output.status.success() {
-        return Err(format!(
-            "导出 ONNX 失败:\n{}\n{}",
-            trim_tail(&export_stdout, 2000),
-            trim_tail(&export_stderr, 2000)
-        ));
+    if let Some(rt) = runtime {
+        let guard = rt.lock().await;
+        if guard.stop_requested {
+            return Err("训练已暂停，可选择继续训练。".to_string());
+        }
     }
 
     let onnx_candidates = [
@@ -2015,6 +2198,8 @@ pub async fn train_and_update_recognition_model(
     let report = serde_json::json!({
         "created_at": Utc::now().to_rfc3339(),
         "dataset_yaml": dataset_yaml,
+        "resume_training": resume_training,
+        "reset_run": reset_run,
         "epochs": epochs,
         "imgsz": imgsz,
         "python_bin": python_bin,
@@ -2039,4 +2224,139 @@ pub async fn train_and_update_recognition_model(
         train_stdout_tail: trim_tail(&train_stdout, 1200),
         train_stderr_tail: trim_tail(&train_stderr, 1200),
     })
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn start_recognition_training_task(
+    dataset_dir: String,
+    output_dir: String,
+    target_model_path: String,
+    epochs: Option<u32>,
+    imgsz: Option<u32>,
+    python_bin: Option<String>,
+    resume_training: Option<bool>,
+    reset_run: Option<bool>,
+) -> Result<RecognitionTrainingStatus, String> {
+    let epochs = epochs.unwrap_or(30).clamp(1, 300);
+    let imgsz = imgsz.unwrap_or(640).clamp(320, 1280);
+    let python_bin = python_bin.unwrap_or_else(|| "python".to_string());
+    let resume_training = resume_training.unwrap_or(false);
+    let reset_run = reset_run.unwrap_or(!resume_training);
+
+    let runtime = train_runtime();
+    {
+        let mut guard = runtime.lock().await;
+        if guard.status.running {
+            return Err("已有训练任务在运行，请先暂停或等待完成。".to_string());
+        }
+
+        guard.stop_requested = false;
+        guard.active_pid = None;
+        guard.status = RecognitionTrainingStatus {
+            running: true,
+            resume_mode: resume_training,
+            phase: "preparing".to_string(),
+            message: if resume_training {
+                "准备继续训练...".to_string()
+            } else {
+                "准备重新训练...".to_string()
+            },
+            dataset_dir: dataset_dir.clone(),
+            output_dir: output_dir.clone(),
+            run_dir: PathBuf::from(&output_dir)
+                .join("recognition_yolo")
+                .to_string_lossy()
+                .to_string(),
+            target_model_path: target_model_path.clone(),
+            epochs,
+            imgsz,
+            python_bin: python_bin.clone(),
+            started_at: Some(Utc::now().to_rfc3339()),
+            finished_at: None,
+            stopped_by_user: false,
+            last_error: None,
+            result: None,
+        };
+    }
+
+    let runtime_for_task = runtime.clone();
+    let handle = tokio::spawn(async move {
+        let result = run_training_pipeline(
+            dataset_dir,
+            output_dir,
+            target_model_path,
+            epochs,
+            imgsz,
+            python_bin,
+            resume_training,
+            reset_run,
+            Some(runtime_for_task.clone()),
+        )
+        .await;
+
+        let mut guard = runtime_for_task.lock().await;
+        guard.active_pid = None;
+        guard.status.running = false;
+        guard.status.finished_at = Some(Utc::now().to_rfc3339());
+
+        match result {
+            Ok(train_result) => {
+                guard.status.phase = "completed".to_string();
+                guard.status.message = "训练完成并已更新模型".to_string();
+                guard.status.result = Some(train_result);
+                guard.status.last_error = None;
+                guard.status.stopped_by_user = false;
+            }
+            Err(err) => {
+                if guard.stop_requested {
+                    guard.status.phase = "paused".to_string();
+                    guard.status.message = "训练已暂停，可选择继续训练".to_string();
+                    guard.status.stopped_by_user = true;
+                    guard.status.last_error = None;
+                } else {
+                    guard.status.phase = "failed".to_string();
+                    guard.status.message = "训练失败".to_string();
+                    guard.status.stopped_by_user = false;
+                    guard.status.last_error = Some(err);
+                }
+                guard.status.result = None;
+            }
+        }
+
+        guard.stop_requested = false;
+        guard.handle = None;
+    });
+
+    let mut guard = runtime.lock().await;
+    guard.handle = Some(handle);
+    Ok(guard.status.clone())
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn get_recognition_training_status() -> Result<RecognitionTrainingStatus, String> {
+    let runtime = train_runtime();
+    let guard = runtime.lock().await;
+    Ok(guard.status.clone())
+}
+
+#[cfg_attr(feature = "gui", tauri::command)]
+pub async fn stop_recognition_training() -> Result<RecognitionTrainingStatus, String> {
+    let runtime = train_runtime();
+    let pid_to_kill = {
+        let mut guard = runtime.lock().await;
+        if !guard.status.running {
+            return Ok(guard.status.clone());
+        }
+
+        guard.stop_requested = true;
+        guard.status.message = "正在暂停训练，请稍候...".to_string();
+        guard.active_pid
+    };
+
+    if let Some(pid) = pid_to_kill {
+        let _ = terminate_process(pid).await;
+    }
+
+    let guard = runtime.lock().await;
+    Ok(guard.status.clone())
 }
